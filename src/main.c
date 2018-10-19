@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <float.h>
+#include <assert.h>
 
 #include "export.h"
 
@@ -14,11 +16,6 @@ typedef struct {
     double y;
     double z;
 } vec3;
-
-typedef struct {
-    vec3 pt;
-    vec3 dir;
-} ray;
 
 vec3 vec3_scale(vec3 vec, double scale) {
     return (vec3){vec.x * scale, vec.y * scale, vec.z * scale};
@@ -52,13 +49,103 @@ bool vec3_eq(vec3 a, vec3 b) {
     return vec3_norm_sq(vec3_sub(a, b)) < EPSILON;
 }
 
-const vec3 sphere_center = {0.2, 0.2, -3};
-const double sphere_radius = 1;
-const vec3 light_pos = {6, 6, 4};
-const double light_intensity = 1;
+typedef struct { double r, g, b; } color;
 
-bool intersect_ray_sphere(ray ray, vec3 sphere_center, double sphere_radius, vec3 *near_isec,
-        vec3 *far_isec) {
+typedef struct {
+    vec3 pt;
+    vec3 dir;
+} ray;
+
+typedef struct {
+    enum {
+        DIFFUSE,
+        MIRROR,
+        GLASS,
+    } type;
+
+    color albedo;
+} material;
+
+typedef struct {
+    vec3 center;
+    double radius;
+    material material;
+} sphere;
+
+typedef struct mesh_geom mesh_geom;
+
+typedef struct {
+    mesh_geom* geometry;
+    material material;
+} mesh;
+
+typedef struct {
+    vec3 position;
+    color color;
+} point_light;
+
+typedef struct {
+    enum {
+        SPHERE,
+        MESH,
+    } type;
+
+    void *ptr;
+} object;
+
+typedef struct {
+    enum {
+        POINT,
+    } type;
+
+    void *ptr;
+} light;
+
+/* Scene definition */
+
+sphere sphere1 = {
+        .center={0.2, 0.2, -3},
+        .radius=1,
+        .material={
+                .type=DIFFUSE,
+                .albedo={1, 1, 1},
+        }
+};
+
+point_light light1 = {
+        .position={6, 6, 4},
+        .color={1, 1, 1},
+};
+
+object scene_objs[] = {
+        {SPHERE, &sphere1},
+};
+const SCENE_OBJS = sizeof(scene_objs) / sizeof(scene_objs[0]);
+
+light scene_lights[] = {
+        {POINT, &light1},
+};
+const SCENE_LIGHTS = sizeof(scene_lights) / sizeof(scene_lights[0]);
+
+/* End scene definition */
+
+#define MAX_PATH_LEN 10
+
+typedef struct {
+    size_t len;
+    object objects[MAX_PATH_LEN];
+    ray rays[MAX_PATH_LEN];
+} path;
+
+void path_add(path *path, object obj, ray ray) {
+    assert(path->len < MAX_PATH_LEN);
+    path->objects[path->len] = obj;
+    path->rays[path->len] = ray;
+    path->len++;
+}
+
+bool sphere_intersect_ray(sphere *sphere, ray ray, vec3 *near_isec,
+                          vec3 *far_isec) {
     // Define formula vars
     double a = ray.dir.x;
     double b = ray.dir.y;
@@ -68,10 +155,10 @@ bool intersect_ray_sphere(ray ray, vec3 sphere_center, double sphere_radius, vec
     double e = ray.pt.y;
     double f = ray.pt.z;
 
-    double j = sphere_center.x;
-    double k = sphere_center.y;
-    double l = sphere_center.z;
-    double r = sphere_radius;
+    double j = sphere->center.x;
+    double k = sphere->center.y;
+    double l = sphere->center.z;
+    double r = sphere->radius;
 
     // Compute the coefficients for the quadratic
     double A = a * a + b * b + c * c;
@@ -107,6 +194,66 @@ bool intersect_ray_sphere(ray ray, vec3 sphere_center, double sphere_radius, vec
     return true;
 }
 
+bool sphere_find_inray(sphere *sphere, ray outray, ray *inray) {
+    switch (sphere->material.type) {
+        case GLASS:
+        case MIRROR:
+        case DIFFUSE:;
+            return false;
+    }
+}
+
+/* Algorithm:
+ * for each ray in image /(currently inbound ray):
+ *   while inbound ray defined:
+ *     find nearest object intersection
+ *     add object and original ray to path
+ *     find inbound ray to intercept
+ *   for each object in path:
+ *     for each colored light ray associated with object's departing ray:
+ *       apply ray to object and material
+ *     combine departing ray colors
+ *   set pixel color to color of final departing ray entering camera
+ */
+
+color trace_ray(ray camera_ray) {
+    path path = {};
+    color outbound_color = {0, 0, 0};
+
+    ray backwards_ray = camera_ray;
+
+    while (true) {
+        // Find object with nearest intersection
+        bool intersect_found = false;
+        double smallest_t = 0;
+        object intersect_object = {};
+
+        for (int obj_idx = 0; obj_idx < SCENE_OBJS; obj_idx++) {
+            object obj = scene_objs[obj_idx];
+            double near_t;
+
+            switch (obj.type) {
+                case SPHERE:;
+                    sphere *sphere = obj.ptr;
+                    bool hit = sphere_intersect_ray(sphere, backwards_ray, &near_t, NULL);
+                    if (hit && (!intersect_found || near_t < smallest_t)) {
+                        intersect_found = true;
+                        smallest_t = near_t;
+                        intersect_object = obj;
+                    }
+                    break;
+
+                case MESH:;
+                    break;
+            }
+        }
+
+        break;
+    }
+
+    return outbound_color;
+}
+
 int main() {
     unsigned num_pixels = IMG_HEIGHT * IMG_WIDTH;
     double *render_buffer = calloc(num_pixels, sizeof(double));
@@ -128,24 +275,24 @@ int main() {
 
             // Compute the near-intersection with the sphere
             vec3 cam_sphere_intersect;
-            if (!intersect_ray_sphere(incoming_ray, sphere_center, sphere_radius,
-                    &cam_sphere_intersect, NULL)) continue;
+            if (!sphere_intersect_ray(sphere1, incoming_ray,
+                                      &cam_sphere_intersect, NULL)) continue;
 
             // Compute intersect-light ray
             vec3 light_sphere_ray = vec3_scale(
-                    vec3_normalize(vec3_sub(cam_sphere_intersect, light_pos)),
-                    light_intensity);
+                    vec3_normalize(vec3_sub(cam_sphere_intersect, light1.position)),
+                    light1.color.r);
 
             // Check if it's occluded by the other side of the sphere
-            ray intersect_light_ray = {light_pos, light_sphere_ray};
+            ray intersect_light_ray = {light1.position, light_sphere_ray};
             vec3 near_light_sphere_intersect;
-            if (!intersect_ray_sphere(intersect_light_ray, sphere_center, sphere_radius,
-                    &near_light_sphere_intersect, NULL)) continue;
+            if (!sphere_intersect_ray(sphere1, intersect_light_ray,
+                                      &near_light_sphere_intersect, NULL)) continue;
             if (!vec3_eq(near_light_sphere_intersect, cam_sphere_intersect)) continue;
 
             // Evaluate the surface scattering distribution function (matte)
             vec3 sphere_intersect_norm = vec3_normalize(vec3_sub(cam_sphere_intersect,
-                    sphere_center));
+                    sphere1.center));
             double refl_intensity = -vec3_dot(light_sphere_ray, sphere_intersect_norm);
 
             render_buffer[y * IMG_HEIGHT + x] = refl_intensity;
